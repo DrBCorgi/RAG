@@ -1,0 +1,189 @@
+import pandas as pd
+import numpy as np
+import re
+import textwrap
+from pathlib import Path
+from typing import List
+import os
+import faiss
+from io import BytesIO
+import tempfile
+import pickle
+import streamlit as st
+from langchain.embeddings import HuggingFaceEmbeddings
+from llama_index.core import VectorStoreIndex, StorageContext
+from llama_index.core.indices.postprocessor import SentenceTransformerRerank
+from llama_index.core.retrievers import AutoMergingRetriever
+from llama_index.core.query_engine import RetrieverQueryEngine
+from llama_index.core import Document
+from llama_index.embeddings.langchain import LangchainEmbedding
+from llama_index.core import ServiceContext
+from llama_index.core.node_parser import SimpleNodeParser
+from llama_index.core import download_loader
+
+from llama_index.llms.llama_cpp import LlamaCPP
+from llama_index.llms.llama_cpp.llama_utils import (
+    messages_to_prompt,
+    completion_to_prompt,
+)
+
+llm = LlamaCPP(
+    model_url="",
+    model_path="YOUR MODEL PATH GOES HERE",
+    temperature=0.1,
+    max_new_tokens=1024,
+    context_window=2048,  # Increased context_window
+    generate_kwargs={},
+    model_kwargs={
+        "n_gpu_layers": 1,
+        "n_ctx": 2048,
+        "seed": 42,
+        "f16_kv": True,
+        "logits_all": False,
+        "vocab_only": False,
+        "use_mmap": True,
+        "use_mlock": False,
+        "embedding": True,
+        "n_batch": 512,
+        "n_threads": 4
+    },
+    messages_to_prompt=messages_to_prompt,
+    completion_to_prompt=completion_to_prompt,
+    verbose=False,
+)
+
+class CustomHuggingFaceEmbeddings(LangchainEmbedding):
+    def __init__(self, model_name):
+        base_embedding = HuggingFaceEmbeddings(model_name=model_name)
+        super().__init__(base_embedding)
+
+# Load PDF using PDFReader
+def load_pdf(file):
+    with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+        tmp_file.write(file.read())
+        tmp_file_path = tmp_file.name
+
+    PDFReader = download_loader("PDFReader")
+    loader = PDFReader()
+    documents = loader.load_data(file=Path(tmp_file_path))
+    return documents
+
+# Create embeddings for document chunks
+def create_embeddings(documents):
+    texts = [doc.text for doc in documents]
+    embeddings = []
+    progress_bar = st.progress(0)
+    for i, text in enumerate(texts):
+        embedding = embed_model.embed_query(text)
+        embeddings.append(embedding)
+        progress = (i + 1) / len(texts)
+        progress_bar.progress(progress)
+    return np.array(embeddings)
+
+# Save embeddings and IDs to disk
+def save_embeddings(embeddings, ids, file_path):
+    with open(file_path, 'wb') as f:
+        pickle.dump((embeddings, ids), f)
+
+# Load embeddings and IDs from disk
+def load_embeddings(file_path):
+    with open(file_path, 'rb') as f:
+        embeddings, ids = pickle.load(f)
+    return embeddings, ids
+
+# Build FAISS index
+def build_index(embeddings):
+    index = faiss.IndexFlatL2(embeddings.shape[1])
+    index.add(embeddings)
+    return index
+
+# Create storage context
+storage_context = StorageContext.from_defaults()
+
+# Create re-ranker
+rerank = SentenceTransformerRerank(top_n=4, model="BAAI/bge-reranker-base")
+
+def rag(query, index, embeddings, ids, documents):
+    # Create a node parser
+    node_parser = SimpleNodeParser()
+    
+    # Create the service context
+    auto_merging_context = ServiceContext.from_defaults(
+        llm=llm,
+        embed_model="local:BAAI/bge-small-en-v1.5",
+        node_parser=node_parser,
+    )
+    
+    # Create the index from the configuration
+    automerging_index = VectorStoreIndex.from_documents(
+        documents, storage_context=storage_context, service_context=auto_merging_context
+    )
+
+    # Get retriever from the index
+    automerging_retriever = automerging_index.as_retriever(similarity_top_k=12)
+
+    # Create the query engine wrapper
+    auto_merging_engine = RetrieverQueryEngine.from_args(
+        automerging_retriever, 
+        node_postprocessors=[rerank], 
+        verbose=True, 
+        service_context=auto_merging_context
+    )
+
+    # Query the index
+    response = auto_merging_engine.query(query)
+    return response
+
+# Streamlit app
+def main():
+    st.title("PDF Question Answering Assistant")
+    
+    # Prompt for model file using Streamlit file uploader
+    model_file = st.file_uploader("Upload model file")
+    
+    if model_file is not None:
+        with open(model_file.name, "wb") as f:
+            f.write(model_file.getvalue())
+        st.success(f"Model file {model_file.name} uploaded successfully.")
+    
+    # Prompt for PDF file using Streamlit file uploader  
+    pdf_file = st.file_uploader("Upload PDF file", type=["pdf"])
+    
+    if pdf_file:
+        # Load PDF and create embeddings
+        documents = load_pdf(pdf_file)
+        embeddings_path = 'embeddings.pkl'
+        
+        if os.path.exists(embeddings_path):
+            embeddings, ids = load_embeddings(embeddings_path)
+        else:
+            st.info("Creating embeddings...")
+            embeddings = create_embeddings(documents)
+            ids = list(range(len(documents)))
+            save_embeddings(embeddings, ids, embeddings_path)
+            st.success("Embeddings created and saved.")
+        
+        # Build FAISS index
+        index = build_index(embeddings)
+        
+        # Get user input
+        query = st.text_input("Enter your question:")
+        
+        if query:
+            # Generate response
+            st.info("Generating response...")
+            response = rag(query, index, embeddings, ids, documents)
+            st.success("Response generated.")
+            # Extract the string content from the Response object
+            response_text = str(response)
+            # Escape special characters in the response text
+            response_text = re.sub(r'([$\\*_{}[\]()#+\-.!|])', r'\\\1', response_text)
+            # Display the formatted response text using st.markdown()
+            st.markdown(response_text)
+    else:
+        st.write("No PDF file selected.")
+
+if __name__ == '__main__':
+    # Initialize custom Hugging Face embeddings
+    embed_model = CustomHuggingFaceEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+    main()
